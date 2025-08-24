@@ -1,0 +1,187 @@
+version: '3.8'
+
+services:
+  # База данных PostgreSQL
+  postgres:
+    image: postgres:15-alpine
+    container_name: analytics_postgres
+    environment:
+      POSTGRES_DB: analytics_db
+      POSTGRES_USER: analytics_user
+      POSTGRES_PASSWORD: analytics_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./DATABASE_SCHEMA.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - analytics_network
+    restart: unless-stopped
+
+  # Redis для кеширования и Celery
+  redis:
+    image: redis:7-alpine
+    container_name: analytics_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - analytics_network
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+
+  # Backend API
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: analytics_api
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://analytics_user:analytics_password@postgres:5432/analytics_db
+      - ASYNC_DATABASE_URL=postgresql+asyncpg://analytics_user:analytics_password@postgres:5432/analytics_db
+      - REDIS_URL=redis://redis:6379
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - DEBUG=True
+    volumes:
+      - ./backend:/app
+      - analytics_uploads:/app/uploads
+      - analytics_reports:/app/reports
+      - analytics_logs:/app/logs
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - analytics_network
+    restart: unless-stopped
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Celery Worker для асинхронных задач
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: analytics_celery_worker
+    environment:
+      - DATABASE_URL=postgresql://analytics_user:analytics_password@postgres:5432/analytics_db
+      - ASYNC_DATABASE_URL=postgresql+asyncpg://analytics_user:analytics_password@postgres:5432/analytics_db
+      - REDIS_URL=redis://redis:6379
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    volumes:
+      - ./backend:/app
+      - analytics_uploads:/app/uploads
+      - analytics_reports:/app/reports
+      - analytics_logs:/app/logs
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - analytics_network
+    restart: unless-stopped
+    command: celery -A app.core.celery worker --loglevel=info
+
+  # Celery Beat для периодических задач
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: analytics_celery_beat
+    environment:
+      - DATABASE_URL=postgresql://analytics_user:analytics_password@postgres:5432/analytics_db
+      - ASYNC_DATABASE_URL=postgresql+asyncpg://analytics_user:analytics_password@postgres:5432/analytics_db
+      - REDIS_URL=redis://redis:6379
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    volumes:
+      - ./backend:/app
+      - analytics_logs:/app/logs
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - analytics_network
+    restart: unless-stopped
+    command: celery -A app.core.celery beat --loglevel=info
+
+  # Flower для мониторинга Celery
+  flower:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: analytics_flower
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    depends_on:
+      - redis
+    networks:
+      - analytics_network
+    restart: unless-stopped
+    command: celery -A app.core.celery flower --port=5555
+
+  # Frontend (React приложение)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: analytics_frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000/api/v1
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - api
+    networks:
+      - analytics_network
+    restart: unless-stopped
+
+  # Nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    container_name: analytics_nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf
+      - analytics_static:/var/www/static
+    depends_on:
+      - api
+      - frontend
+    networks:
+      - analytics_network
+    restart: unless-stopped
+
+  # Adminer для управления БД
+  adminer:
+    image: adminer
+    container_name: analytics_adminer
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+    networks:
+      - analytics_network
+    restart: unless-stopped
+
+networks:
+  analytics_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  analytics_uploads:
+  analytics_reports:
+  analytics_logs:
+  analytics_static:
